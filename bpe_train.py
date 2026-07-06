@@ -5,6 +5,13 @@ import argparse
 
 import regex as re
 
+import argparse
+import json
+import pickle
+import time
+import tracemalloc
+from pathlib import Path
+
 
 # GPT-2-style pre-tokenization regex.
 # The normal Python "re" module does not support \p{L} and \p{N},
@@ -212,6 +219,81 @@ def train_bpe(
 
     return vocab, merges
 
+def serialize_bpe_result(
+    vocab: dict[int, bytes],
+    merges: list[tuple[bytes, bytes]],
+    output_dir: str | Path,
+    elapsed_seconds: float | None = None,
+    peak_memory_mb: float | None = None,
+) -> None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Exact Python serialization
+    with open(output_dir / "vocab.pkl", "wb") as f:
+        pickle.dump(vocab, f)
+
+    with open(output_dir / "merges.pkl", "wb") as f:
+        pickle.dump(merges, f)
+
+    # Human-readable vocabulary
+    vocab_json = {
+        str(token_id): {
+            "hex": token_bytes.hex(),
+            "repr": repr(token_bytes),
+            "utf8_preview": token_bytes.decode("utf-8", errors="replace"),
+            "length_bytes": len(token_bytes),
+        }
+        for token_id, token_bytes in vocab.items()
+    }
+
+    with open(output_dir / "vocab.json", "w", encoding="utf-8") as f:
+        json.dump(vocab_json, f, ensure_ascii=False, indent=2)
+
+    # Human-readable merges
+    merges_json = [
+        {
+            "rank": i,
+            "left_hex": left.hex(),
+            "right_hex": right.hex(),
+            "left_repr": repr(left),
+            "right_repr": repr(right),
+            "merged_repr": repr(left + right),
+            "merged_utf8_preview": (left + right).decode("utf-8", errors="replace"),
+            "merged_length_bytes": len(left + right),
+        }
+        for i, (left, right) in enumerate(merges)
+    ]
+
+    with open(output_dir / "merges.json", "w", encoding="utf-8") as f:
+        json.dump(merges_json, f, ensure_ascii=False, indent=2)
+
+    # Longest token
+    longest_token_id, longest_token = max(
+        vocab.items(),
+        key=lambda item: len(item[1]),
+    )
+
+    summary = {
+        "vocab_size": len(vocab),
+        "num_merges": len(merges),
+        "longest_token_id": longest_token_id,
+        "longest_token_length_bytes": len(longest_token),
+        "longest_token_repr": repr(longest_token),
+        "longest_token_utf8_preview": longest_token.decode("utf-8", errors="replace"),
+        "elapsed_seconds": elapsed_seconds,
+        "peak_memory_mb_tracemalloc": peak_memory_mb,
+    }
+
+    with open(output_dir / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    print(f"Saved BPE artifacts to: {output_dir}")
+    print(f"Vocabulary size: {len(vocab)}")
+    print(f"Number of merges: {len(merges)}")
+    print(f"Longest token ID: {longest_token_id}")
+    print(f"Longest token length in bytes: {len(longest_token)}")
+    print(f"Longest token preview: {longest_token.decode('utf-8', errors='replace')!r}")
 
 # Optional adapter function, useful if your assignment expects this name.
 def run_train_bpe(
@@ -226,23 +308,32 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "input_path",
-        help="Path to the input training text file",
+        help="Path to the training text file",
     )
 
     parser.add_argument(
         "vocab_size",
         type=int,
-        help="Target vocabulary size",
+        help="Maximum vocabulary size",
     )
 
     parser.add_argument(
         "--special-token",
         action="append",
         default=[],
-        help="Special token to exclude from BPE training. Can be used multiple times.",
+        help="Special token to add to the vocabulary. Can be used multiple times.",
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        default="bpe_artifacts",
+        help="Directory where vocab and merges will be saved",
     )
 
     args = parser.parse_args()
+
+    tracemalloc.start()
+    start_time = time.perf_counter()
 
     vocab, merges = train_bpe(
         input_path=args.input_path,
@@ -250,8 +341,19 @@ if __name__ == "__main__":
         special_tokens=args.special_token,
     )
 
-    print("Vocabulary size:", len(vocab))
-    print("Number of merges:", len(merges))
-    print("First 10 merges:")
-    for merge in merges[:10]:
-        print(merge)
+    elapsed_seconds = time.perf_counter() - start_time
+    current_memory, peak_memory = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    peak_memory_mb = peak_memory / 1024 / 1024
+
+    serialize_bpe_result(
+        vocab=vocab,
+        merges=merges,
+        output_dir=args.output_dir,
+        elapsed_seconds=elapsed_seconds,
+        peak_memory_mb=peak_memory_mb,
+    )
+
+    print(f"Training time: {elapsed_seconds:.2f} seconds")
+    print(f"Peak traced Python memory: {peak_memory_mb:.2f} MB")
